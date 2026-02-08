@@ -1,0 +1,36 @@
+{
+  "name": "broker",
+  "version": "1.0.0",
+  "description": "test commit",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/run.ts",
+    "start": "node dist/run.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/056xyz/broker.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/056xyz/broker/issues"
+  },
+  "homepage": "https://github.com/056xyz/broker#readme",
+  "dependencies": {
+    "@langchain/core": "^1.1.19",
+    "@langchain/langgraph": "^1.1.4",
+    "@langchain/openai": "^1.2.5",
+    "@mendable/firecrawl-js": "^4.12.0",
+    "dotenv": "^17.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
