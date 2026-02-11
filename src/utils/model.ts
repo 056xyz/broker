@@ -1,7 +1,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 
 export const model = new ChatOpenAI({
-  model: "anthropic/claude-sonnet-4",
+  model: "anthropic/claude-opus-4.6",
   temperature: 0,
   apiKey: process.env.OPENROUTER_API_KEY,
   configuration: {

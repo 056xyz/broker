@@ -59,21 +59,117 @@ async function extractionNode(state: typeof State.State) {
   };
 }
 
-const ANALYZE_SYSTEM = `You are an expert in buying and selling properties, interior design, and efficient use of living space. You give complete, thorough, and actionable analyses of apartments. Your audience is a potential buyer or investor who wants a professional assessment. Base your analysis strictly on the structured apartment data (and any listing context) provided. Be specific, cite numbers (price, area, etc.) where relevant, and give a clear recommendation. Write in clear paragraphs or bullet points as fits each section.`;
+const MAX_ANALYZE_IMAGES = 15;
+const IMAGE_FETCH_TIMEOUT_MS = 12_000;
+
+/** Provider (Anthropic/OpenRouter) only accepts these image MIME types. */
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
+
+function normalizeImageMime(contentType: string | null): (typeof ALLOWED_IMAGE_TYPES)[number] {
+  const mime = contentType?.split(";")[0]?.trim().toLowerCase() || "image/jpeg";
+  if (ALLOWED_IMAGE_TYPES.includes(mime as (typeof ALLOWED_IMAGE_TYPES)[number])) {
+    return mime as (typeof ALLOWED_IMAGE_TYPES)[number];
+  }
+  if (mime === "image/jpg") return "image/jpeg";
+  return "image/jpeg";
+}
+
+/** Normalize data URL to use an allowed MIME type (for passthrough URLs). */
+function normalizeDataUrl(dataUrl: string): string {
+  const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+  if (!match) return dataUrl;
+  const mime = normalizeImageMime(match[1]);
+  return `data:${mime};base64,${match[2]}`;
+}
+
+/** Minimum image size in bytes to include (skip tiny tracking pixels, icons). */
+const MIN_IMAGE_BYTES = 5_000;
+
+/** Fetch image URLs and convert to base64 data URLs so the LLM provider can use them (they cannot download from many listing sites). */
+async function resolveImagesToDataUrls(urls: string[], max: number): Promise<string[]> {
+  const valid = urls.filter(
+    (u) => typeof u === "string" && (u.startsWith("http") || u.startsWith("data:"))
+  );
+  const result: string[] = [];
+  let fetchCount = 0;
+  let skipped = 0;
+  for (const u of valid) {
+    if (result.length >= max) break;
+    if (u.startsWith("data:")) {
+      result.push(normalizeDataUrl(u));
+      continue;
+    }
+    fetchCount++;
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
+      const res = await fetch(u, {
+        signal: controller.signal,
+        headers: { "User-Agent": "BrokerAI/1.0 (apartment analysis)" },
+      });
+      clearTimeout(t);
+      if (!res.ok) { skipped++; continue; }
+      const rawMime = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+      // Skip non-raster images (SVG, etc.)
+      if (rawMime && !rawMime.startsWith("image/") || rawMime === "image/svg+xml") {
+        console.log("[analyze]   skip (type:", rawMime + ")", u.slice(0, 80));
+        skipped++;
+        continue;
+      }
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength < MIN_IMAGE_BYTES) {
+        console.log("[analyze]   skip (too small:", buf.byteLength, "bytes)", u.slice(0, 80));
+        skipped++;
+        continue;
+      }
+      const base64 = Buffer.from(buf).toString("base64");
+      const mime = normalizeImageMime(res.headers.get("content-type"));
+      console.log("[analyze]   ok", mime, (buf.byteLength / 1024).toFixed(0) + "KB", u.slice(0, 80));
+      result.push(`data:${mime};base64,${base64}`);
+    } catch {
+      skipped++;
+    }
+  }
+  if (fetchCount > 0) {
+    console.log("[analyze] Embedded", result.length, "images, skipped", skipped);
+  }
+  return result;
+}
+
+const ANALYZE_SYSTEM = `You are an expert in buying and selling properties, interior design, and efficient use of living space. You give complete, thorough, and actionable analyses of apartments. Your audience is a potential buyer or investor who wants a professional assessment. Base your analysis on the structured apartment data, the listing text, and the provided photos of the apartment. Use the images to assess layout, condition, natural light, finishes, and space use; cite what you see where relevant. Be specific, cite numbers (price, area, etc.) where relevant, and give a clear recommendation. Write in clear paragraphs or bullet points as fits each section.`;
+
+function buildAnalyzeMessageContent(
+  extracted: ApartmentExtraction | undefined,
+  markdownSnippet: string,
+  imageUrlsOrDataUrls: string[]
+): Array<{ type: "text"; text: string } | { type: "image_url"; image_url: string | { url: string; detail?: "auto" | "low" | "high" } }> {
+  const text = `${ANALYZE_SYSTEM}\n\n--- Extracted apartment data (JSON) ---\n${JSON.stringify(extracted ?? {}, null, 2)}\n\n--- Listing excerpt (for context) ---\n${markdownSnippet || "(none)"}`;
+  const parts: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: string | { url: string; detail?: "auto" | "low" | "high" } }> = [
+    { type: "text", text },
+  ];
+  for (let i = 0; i < Math.min(imageUrlsOrDataUrls.length, MAX_ANALYZE_IMAGES); i++) {
+    parts.push({ type: "image_url", image_url: { url: imageUrlsOrDataUrls[i], detail: "auto" } });
+  }
+  return parts;
+}
 
 async function analyzeNode(state: typeof State.State) {
   const extracted = state.extractedApartment;
   const markdownSnippet = (state.scrapedMarkdown ?? "").slice(0, 8000);
-  console.log("[analyze] Running expert analysis (LLM: market, design, space, recommendation)...");
+  const imageUrls = state.scrapedImages ?? [];
+  const resolvedImages = await resolveImagesToDataUrls(imageUrls, MAX_ANALYZE_IMAGES);
+  console.log("[analyze] Running expert analysis (LLM +", resolvedImages.length, "images: market, design, space, recommendation)...");
 
   const structuredModel = model.withStructuredOutput(ApartmentAnalysisSchema, {
     name: "ApartmentAnalysis",
     method: "functionCalling",
   });
 
+  const content = buildAnalyzeMessageContent(extracted, markdownSnippet, resolvedImages);
+
   const result = await structuredModel.invoke([
     new HumanMessage({
-      content: `${ANALYZE_SYSTEM}\n\n--- Extracted apartment data (JSON) ---\n${JSON.stringify(extracted ?? {}, null, 2)}\n\n--- Listing excerpt (for context) ---\n${markdownSnippet || "(none)"}`,
+      content,
     }),
   ]);
 
